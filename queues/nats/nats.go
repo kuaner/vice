@@ -2,25 +2,19 @@
 package nats
 
 import (
-	"sync"
-
 	"github.com/matryer/vice"
-	"github.com/nats-io/nats"
+	"github.com/nats-io/go-nats"
+	"golang.org/x/sync/syncmap"
 )
-
-// DefaultAddr is the NATS default TCP address.
-const DefaultAddr = nats.DefaultURL
 
 // make sure Transport satisfies vice.Transport interface.
 var _ vice.Transport = (*Transport)(nil)
 
 // Transport is a vice.Transport for NATS queue.
 type Transport struct {
-	rm           sync.Mutex
-	receiveChans map[string]chan []byte
+	receiveChans syncmap.Map
 
-	sm        sync.Mutex
-	sendChans map[string]chan []byte
+	sendChans syncmap.Map
 
 	errChan chan error
 	// stopchan is closed when everything has stopped.
@@ -28,42 +22,37 @@ type Transport struct {
 	//stopPubChan chan struct{}
 
 	subscriptions []*nats.Subscription
-	connections   []*nats.Conn
-
-	// exported fields
-	NatsAddr string
+	nc            *nats.Conn
+	natsAddr      string
 }
 
 // New returns a new Transport
-func New() *Transport {
+func New(natsURL string) (vice.Transport, error) {
+	//TODO bind nats connectiong handler
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		return nil, err
+	}
 	return &Transport{
-		NatsAddr: DefaultAddr,
-
-		receiveChans: make(map[string]chan []byte),
-		sendChans:    make(map[string]chan []byte),
+		receiveChans: syncmap.Map{},
+		sendChans:    syncmap.Map{},
 
 		errChan:  make(chan error, 10),
 		stopchan: make(chan struct{}),
 
 		subscriptions: []*nats.Subscription{},
-		connections:   []*nats.Conn{},
-	}
-}
-
-func (t *Transport) newConnection() (*nats.Conn, error) {
-	return nats.Connect(t.NatsAddr)
+		nc:            nc,
+		natsAddr:      natsURL,
+	}, nil
 }
 
 // Receive gets a channel on which to receive messages
 // with the specified name.
 func (t *Transport) Receive(name string) <-chan []byte {
-	t.rm.Lock()
-	defer t.rm.Unlock()
-
 	ch := make(chan []byte)
-	ch, ok := t.receiveChans[name]
+	val, ok := t.receiveChans.Load(name)
 	if ok {
-		return ch
+		return val.(chan []byte)
 	}
 
 	ch, err := t.makeSubscriber(name)
@@ -71,19 +60,14 @@ func (t *Transport) Receive(name string) <-chan []byte {
 		t.errChan <- vice.Err{Name: name, Err: err}
 	}
 
-	t.receiveChans[name] = ch
+	t.receiveChans.Store(name, ch)
 	return ch
 }
 
 func (t *Transport) makeSubscriber(name string) (chan []byte, error) {
 	ch := make(chan []byte)
 
-	c, err := t.newConnection()
-	if err != nil {
-		return nil, err
-	}
-
-	sub, err := c.Subscribe(name, func(m *nats.Msg) {
+	sub, err := t.nc.Subscribe(name, func(m *nats.Msg) {
 		data := m.Data
 		ch <- data
 		return
@@ -91,7 +75,6 @@ func (t *Transport) makeSubscriber(name string) (chan []byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.connections = append(t.connections, c)
 	t.subscriptions = append(t.subscriptions, sub)
 	return ch, nil
 }
@@ -99,13 +82,11 @@ func (t *Transport) makeSubscriber(name string) (chan []byte, error) {
 // Send gets a channel on which messages with the
 // specified name may be sent.
 func (t *Transport) Send(name string) chan<- []byte {
-	t.sm.Lock()
-	defer t.sm.Unlock()
 
 	ch := make(chan []byte)
-	ch, ok := t.sendChans[name]
+	val, ok := t.sendChans.Load(name)
 	if ok {
-		return ch
+		return val.(chan []byte)
 	}
 
 	ch, err := t.makePublisher(name)
@@ -114,22 +95,18 @@ func (t *Transport) Send(name string) chan<- []byte {
 		return make(chan []byte)
 	}
 
-	t.sendChans[name] = ch
+	t.sendChans.Store(name, ch)
 	return ch
 }
 
 func (t *Transport) makePublisher(name string) (chan []byte, error) {
 	ch := make(chan []byte)
-	c, err := t.newConnection()
-	if err != nil {
-		return nil, err
-	}
 
 	go func() {
 		for {
 			select {
 			case msg := <-ch:
-				if err := c.Publish(name, msg); err != nil {
+				if err := t.nc.Publish(name, msg); err != nil {
 					t.errChan <- vice.Err{Message: msg, Name: name, Err: err}
 					continue
 				}
@@ -137,7 +114,6 @@ func (t *Transport) makePublisher(name string) (chan []byte, error) {
 			}
 		}
 	}()
-	t.connections = append(t.connections, c)
 	return ch, nil
 }
 
@@ -153,9 +129,7 @@ func (t *Transport) Stop() {
 	for _, s := range t.subscriptions {
 		s.Unsubscribe()
 	}
-	for _, conn := range t.connections {
-		conn.Close()
-	}
+	t.nc.Close()
 	close(t.stopchan)
 }
 
